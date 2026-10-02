@@ -1,14 +1,10 @@
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
-
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
-app = FastAPI(title="NEKSUS ELD API", version="3.0.0")
+app = FastAPI(title="NEKSUS ELD Backend")
 
-# Frontend may be hosted on Netlify, Vercel, or another HTTPS host.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,151 +13,108 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# No hard-coded demo drivers.
-# Real driver records should be supplied by the ELD/dispatch system.
-drivers: List[Dict[str, Any]] = []
+DRIVERS = [
+    {
+        "id": "D001", "name": "Driver 01", "carrier": "NEKSUS",
+        "status": "ON", "truck": "TRK-101", "trailer": "TRL-201",
+        "location_text": "Dallas, TX", "latitude": 32.7767, "longitude": -96.7970,
+        "connected": True, "certified": True, "timezone": "America/Chicago",
+        "revision": 1,
+    },
+    {
+        "id": "D002", "name": "Driver 02", "carrier": "NEKSUS",
+        "status": "DR", "truck": "TRK-102", "trailer": "TRL-202",
+        "location_text": "Houston, TX", "latitude": 29.7604, "longitude": -95.3698,
+        "connected": True, "certified": True, "timezone": "America/Chicago",
+        "revision": 1,
+    },
+]
 
+CLIENTS = set()
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+def hos_for(driver_id):
+    driver = next((d for d in DRIVERS if d["id"] == driver_id), None)
+    if not driver:
+        raise HTTPException(404, "Driver not found")
+    return {
+        "driver_id": driver_id,
+        "break_remaining": 480,
+        "drive_remaining": 660,
+        "shift_remaining": 840,
+        "cycle_remaining": 4200,
+        "current_status": driver["status"],
+        "as_of": now_iso(),
+        "revision": 1,
+    }
 
 @app.get("/")
 def root():
-    return {
-        "service": "NEKSUS ELD API",
-        "status": "ok",
-        "version": app.version,
-        "drivers": len(drivers),
-    }
-
+    return {"service": "NEKSUS ELD Backend", "status": "ok"}
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
+    return {"status": "ok", "time": now_iso()}
 
 @app.get("/v1/drivers")
-def get_drivers():
-    return JSONResponse(
-        {
-            "drivers": drivers,
-            "total": len(drivers),
-        }
-    )
+def drivers(limit: int = 500):
+    return {"drivers": DRIVERS[:max(0, limit)]}
 
+@app.get("/v1/alerts")
+def alerts(status: str = "open"):
+    return {"alerts": []}
 
-@app.get("/v1/drivers/{driver_id}")
-def get_driver(driver_id: str):
-    for driver in drivers:
-        if str(driver.get("id")) == str(driver_id):
-            return driver
+@app.get("/v1/fleet/live")
+def fleet_live():
+    return {"drivers": DRIVERS}
 
-    return JSONResponse(
-        status_code=404,
-        content={"detail": "Driver not found"},
-    )
-
-
-@app.get("/v1/drivers/{driver_id}/logs")
-def get_driver_logs(
-    driver_id: str,
-    date: Optional[str] = None,
-):
-    for driver in drivers:
-        if str(driver.get("id")) == str(driver_id):
-            return {
-                "driverId": driver_id,
-                "date": date,
-                "events": [],
-                "segments": [],
-                "source": "eld",
-            }
-
-    return JSONResponse(
-        status_code=404,
-        content={"detail": "Driver not found"},
-    )
-
+@app.get("/v1/hos/current")
+def hos_current():
+    return {"hos": [hos_for(d["id"]) for d in DRIVERS]}
 
 @app.get("/v1/drivers/{driver_id}/hos")
-def get_driver_hos(
-    driver_id: str,
-    date: Optional[str] = None,
-):
-    for driver in drivers:
-        if str(driver.get("id")) == str(driver_id):
-            # Empty HOS response until a real ELD source is connected.
-            return {
-                "driverId": driver_id,
-                "date": date,
-                "segments": [],
-                "totals": {
-                    "OFF": 0,
-                    "SB": 0,
-                    "DR": 0,
-                    "ON": 0,
-                },
-                "source": "eld",
-            }
+def driver_hos(driver_id: str):
+    return hos_for(driver_id)
 
-    return JSONResponse(
-        status_code=404,
-        content={"detail": "Driver not found"},
-    )
-
+@app.get("/v1/drivers/{driver_id}/logs/{date}")
+def driver_log(driver_id: str, date: str):
+    driver = next((d for d in DRIVERS if d["id"] == driver_id), None)
+    if not driver:
+        raise HTTPException(404, "Driver not found")
+    return {
+        "driver_id": driver_id,
+        "date": date,
+        "timezone": driver["timezone"],
+        "revision": 1,
+        "segments": [],
+        "events": [],
+        "hos": hos_for(driver_id),
+    }
 
 @app.websocket("/v1/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-
-    await websocket.send_json(
-        {
-            "type": "connection",
-            "status": "connected",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-    )
-
+async def websocket_endpoint(ws: WebSocket):
+    await ws.accept()
+    CLIENTS.add(ws)
     try:
+        await ws.send_json({"type": "connected", "ts": now_iso()})
         while True:
-            message = await websocket.receive_json()
-
-            action = message.get("action")
-
-            if action == "ping":
-                await websocket.send_json(
-                    {
-                        "type": "pong",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
-            elif action == "drivers":
-                await websocket.send_json(
-                    {
-                        "type": "drivers",
-                        "drivers": drivers,
-                        "total": len(drivers),
-                    }
-                )
-            else:
-                await websocket.send_json(
-                    {
-                        "type": "ack",
-                        "action": action,
-                    }
-                )
-
-    except Exception:
-        # Client disconnected.
-        return
-
+            message = await ws.receive_json()
+            if message.get("type") == "ping":
+                await ws.send_json({"type": "pong", "ts": now_iso()})
+            elif message.get("type") == "authenticate":
+                await ws.send_json({"type": "authenticated"})
+            elif message.get("type") == "subscribe":
+                await ws.send_json({
+                    "type": "subscription.confirmed",
+                    "topics": message.get("topics", [])
+                })
+    except WebSocketDisconnect:
+        pass
+    finally:
+        CLIENTS.discard(ws)
 
 if __name__ == "__main__":
     import uvicorn
-
-    port = int(os.environ.get("PORT", "10000"))
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=port,
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
